@@ -20,10 +20,12 @@
 #include "cs_driver_mm.h"
 
 /* Set to 1 to only log what would be hooked, without actually hooking. */
-#define HYPERVISORHIDE_DEBUG_ONLY 1
+#define HYPERVISORHIDE_DEBUG_ONLY 0
 
 /* Set to 1 to skip ALL driver logic and just return SUCCESS (bare minimum test) */
-#define HYPERVISORHIDE_STUB_ONLY 1
+/* Set to 1 for hardcoded addresses (Win11 26200 only), bypasses Capstone */
+#define HYPERVISORHIDE_HARDCODED 1
+#define HYPERVISORHIDE_STUB_ONLY 0
 
 extern "C"
 {
@@ -376,6 +378,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
         return STATUS_UNSUCCESSFUL;
     }
 
+#if HYPERVISORHIDE_HARDCODED
+    /* Hardcoded offsets for Win11 26200 — found via find_firmware_table.py.
+     * These are RVAs from ntoskrnl base. */
+    g_ExpFirmwareTableResource = (PUCHAR)g_NtosBase + 0xEFEB20;
+    g_ExpFirmwareTableProviderListHead = (PUCHAR)g_NtosBase + 0xEFEB98;
+
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+               "HypervisorHide: HARDCODED mode — Resource=%p ListHead=%p\n",
+               g_ExpFirmwareTableResource, g_ExpFirmwareTableProviderListHead);
+    goto do_hook;
+#endif
+
     /* 2. Find PAGE section */
     auto ntHeader = RtlImageNtHeader(g_NtosBase);
     if (!ntHeader) return STATUS_UNSUCCESSFUL;
@@ -451,6 +465,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
 #endif
     }
 
+do_hook:
     /* 4. Validate the pointers before using them */
     DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
                "HypervisorHide: Resource=%p ListHead=%p\n",
