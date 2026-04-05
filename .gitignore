@@ -1,0 +1,20 @@
+# Build output
+x64/
+Debug/
+Release/
+*.obj
+*.sys
+*.pdb
+*.log
+*.tlog
+*.idb
+*.ipch
+*.sdf
+*.suo
+*.user
+*.ncb
+*.aps
+
+# VS directories
+.vs/
+packages/
