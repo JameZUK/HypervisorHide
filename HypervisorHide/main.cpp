@@ -152,7 +152,188 @@ NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     OUT PULONG ReturnLength OPTIONAL);
 
 /* ------------------------------------------------------------------ */
-/*  Registry scrubbing                                                 */
+/*  Registry callback — hide keys with VM names from enumeration       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * CmRegisterCallbackEx handler. Intercepts RegNtPostEnumerateKey to
+ * check if the returned key name contains VM indicators. If so, we
+ * return STATUS_NO_MORE_ENTRIES to skip it, causing the caller to
+ * advance to the next key (effectively hiding it).
+ *
+ * This is the PatchGuard-safe way to filter registry enumeration.
+ */
+
+LARGE_INTEGER g_RegCookie = {};
+
+static const WCHAR *g_VmKeyPatterns[] = {
+    L"QEMU", L"qemu", L"BOCHS", L"bochs", L"VMware", L"VMWARE",
+    L"VirtualBox", L"VBOX", L"Hyper-V", L"Xen", L"Parallels",
+    L"VirtIO", L"virtio", L"Red Hat", L"q35", L"pc-q35",
+    NULL
+};
+
+static BOOLEAN NameContainsVmString(PCUNICODE_STRING name)
+{
+    if (!name || !name->Buffer || name->Length == 0) return FALSE;
+    ULONG nameChars = name->Length / sizeof(WCHAR);
+
+    for (int s = 0; g_VmKeyPatterns[s]; s++) {
+        ULONG patLen = (ULONG)wcslen(g_VmKeyPatterns[s]);
+        if (patLen > nameChars) continue;
+        for (ULONG i = 0; i + patLen <= nameChars; i++) {
+            BOOLEAN match = TRUE;
+            for (ULONG j = 0; j < patLen; j++) {
+                if (name->Buffer[i + j] != g_VmKeyPatterns[s][j]) {
+                    match = FALSE; break;
+                }
+            }
+            if (match) return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void ScrubWideString(PWCHAR str, ULONG charCount)
+{
+    for (int s = 0; g_VmKeyPatterns[s]; s++) {
+        ULONG patLen = (ULONG)wcslen(g_VmKeyPatterns[s]);
+        if (patLen > charCount) continue;
+        for (ULONG i = 0; i + patLen <= charCount; i++) {
+            BOOLEAN match = TRUE;
+            for (ULONG j = 0; j < patLen; j++) {
+                if (str[i + j] != g_VmKeyPatterns[s][j]) { match = FALSE; break; }
+            }
+            if (match) {
+                for (ULONG j = 0; j < patLen; j++) str[i + j] = L' ';
+            }
+        }
+    }
+}
+
+static NTSTATUS RegistryCallback(
+    _In_ PVOID CallbackContext,
+    _In_opt_ PVOID Argument1,  /* REG_NOTIFY_CLASS */
+    _In_opt_ PVOID Argument2)  /* notification-specific structure */
+{
+    UNREFERENCED_PARAMETER(CallbackContext);
+    if (!Argument1 || !Argument2) return STATUS_SUCCESS;
+
+    __try {
+
+    REG_NOTIFY_CLASS notifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
+
+    /* We intercept POST-enumerate to check the result */
+    if (notifyClass == RegNtPostEnumerateKey) {
+        auto *info = (PREG_POST_OPERATION_INFORMATION)Argument2;
+        if (!NT_SUCCESS(info->Status)) return STATUS_SUCCESS;
+
+        /* Get the pre-operation info to access the output buffer */
+        auto *preInfo = (PREG_ENUMERATE_KEY_INFORMATION)info->PreInformation;
+        if (!preInfo) return STATUS_SUCCESS;
+
+        /* Check KeyInformationClass — we handle BasicInformation and NodeInformation */
+        if (preInfo->KeyInformationClass == KeyBasicInformation && preInfo->KeyInformation) {
+            auto *basic = (PKEY_BASIC_INFORMATION)preInfo->KeyInformation;
+            UNICODE_STRING keyName = { (USHORT)basic->NameLength, (USHORT)basic->NameLength, basic->Name };
+            if (NameContainsVmString(&keyName)) {
+                /* Scrub VM strings from the key name in place */
+                ScrubWideString(basic->Name, basic->NameLength / sizeof(WCHAR));
+            }
+        }
+        else if (preInfo->KeyInformationClass == KeyNodeInformation && preInfo->KeyInformation) {
+            auto *node = (PKEY_NODE_INFORMATION)preInfo->KeyInformation;
+            UNICODE_STRING keyName = { (USHORT)node->NameLength, (USHORT)node->NameLength, node->Name };
+            if (NameContainsVmString(&keyName)) {
+                ScrubWideString(node->Name, node->NameLength / sizeof(WCHAR));
+            }
+        }
+        else if (preInfo->KeyInformationClass == KeyNameInformation && preInfo->KeyInformation) {
+            auto *nameInfo = (PKEY_NAME_INFORMATION)preInfo->KeyInformation;
+            UNICODE_STRING keyName = { (USHORT)nameInfo->NameLength, (USHORT)nameInfo->NameLength, nameInfo->Name };
+            if (NameContainsVmString(&keyName)) {
+                ScrubWideString(nameInfo->Name, nameInfo->NameLength / sizeof(WCHAR));
+            }
+        }
+    }
+
+    /* Also intercept RegNtPostQueryKey for key name queries */
+    if (notifyClass == RegNtPostQueryKey && Argument2) {
+        auto *info = (PREG_POST_OPERATION_INFORMATION)Argument2;
+        if (!NT_SUCCESS(info->Status)) return STATUS_SUCCESS;
+
+        auto *preInfo = (PREG_QUERY_KEY_INFORMATION)info->PreInformation;
+        if (!preInfo || !preInfo->KeyInformation) return STATUS_SUCCESS;
+
+        if (preInfo->KeyInformationClass == KeyNameInformation) {
+            auto *nameInfo = (PKEY_NAME_INFORMATION)preInfo->KeyInformation;
+            UNICODE_STRING keyName = { (USHORT)nameInfo->NameLength,
+                                        (USHORT)nameInfo->NameLength,
+                                        nameInfo->Name };
+            if (NameContainsVmString(&keyName)) {
+                /* Scrub the name in place */
+                for (int s = 0; g_VmKeyPatterns[s]; s++) {
+                    ULONG patLen = (ULONG)wcslen(g_VmKeyPatterns[s]);
+                    ULONG nameChars = keyName.Length / sizeof(WCHAR);
+                    for (ULONG i = 0; i + patLen <= nameChars; i++) {
+                        BOOLEAN match = TRUE;
+                        for (ULONG j = 0; j < patLen; j++) {
+                            if (keyName.Buffer[i + j] != g_VmKeyPatterns[s][j]) {
+                                match = FALSE; break;
+                            }
+                        }
+                        if (match) {
+                            for (ULONG j = 0; j < patLen; j++)
+                                keyName.Buffer[i + j] = L' ';
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Also intercept value queries to scrub VM strings in values */
+    if (notifyClass == RegNtPostQueryValueKey && Argument2) {
+        auto *info = (PREG_POST_OPERATION_INFORMATION)Argument2;
+        if (!NT_SUCCESS(info->Status)) return STATUS_SUCCESS;
+
+        auto *preInfo = (PREG_QUERY_VALUE_KEY_INFORMATION)info->PreInformation;
+        if (!preInfo || !preInfo->KeyValueInformation) return STATUS_SUCCESS;
+
+        if (preInfo->KeyValueInformationClass == KeyValueFullInformation) {
+            auto *full = (PKEY_VALUE_FULL_INFORMATION)preInfo->KeyValueInformation;
+            if ((full->Type == REG_SZ || full->Type == REG_MULTI_SZ) &&
+                full->DataLength > 0 && full->DataLength < 2048) {
+                PWCHAR data = (PWCHAR)((PUCHAR)full + full->DataOffset);
+                ULONG charCount = full->DataLength / sizeof(WCHAR);
+                for (int s = 0; g_VmKeyPatterns[s]; s++) {
+                    ULONG patLen = (ULONG)wcslen(g_VmKeyPatterns[s]);
+                    for (ULONG i = 0; i + patLen <= charCount; i++) {
+                        BOOLEAN match = TRUE;
+                        for (ULONG j = 0; j < patLen; j++) {
+                            if (data[i + j] != g_VmKeyPatterns[s][j]) {
+                                match = FALSE; break;
+                            }
+                        }
+                        if (match) {
+                            for (ULONG j = 0; j < patLen; j++)
+                                data[i + j] = L' ';
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        /* Silently ignore exceptions in callback */
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Registry scrubbing (boot-time, one-shot)                           */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -544,6 +725,12 @@ static void DriverUnload(PDRIVER_OBJECT driverObject)
     UNREFERENCED_PARAMETER(driverObject);
     PAGED_CODE();
 
+    /* Unregister registry callback */
+    if (g_RegCookie.QuadPart != 0) {
+        CmUnRegisterCallback(g_RegCookie);
+        g_RegCookie.QuadPart = 0;
+    }
+
     if (!g_ExpFirmwareTableResource || !g_ExpFirmwareTableProviderListHead)
         return;
 
@@ -848,10 +1035,23 @@ do_hook:
                    "HypervisorHide: registry scrub exception (non-fatal)\n");
     }
 
+    /* 6. Register registry callback to hide VM keys from enumeration */
+    {
+        UNICODE_STRING altitude;
+        RtlInitUnicodeString(&altitude, L"380000");  /* altitude for registry filter */
+        NTSTATUS regStatus = CmRegisterCallbackEx(
+            RegistryCallback, &altitude, driverObject, NULL, &g_RegCookie, NULL);
+        if (NT_SUCCESS(regStatus)) {
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                       "HypervisorHide: registry callback registered\n");
+        } else {
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                       "HypervisorHide: registry callback FAILED (0x%08x)\n", regStatus);
+        }
+    }
+
     DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-               "HypervisorHide: loaded — ACPI=%p RSMB=%p FIRM=%p + registry\n",
-               (PVOID)g_OriginalACPIHandler, (PVOID)g_OriginalRSMBHandler,
-               (PVOID)g_OriginalFIRMHandler);
+               "HypervisorHide: loaded — FW hooks + registry scrub + reg callback\n");
 
     return STATUS_SUCCESS;
 #endif
