@@ -1,58 +1,66 @@
 /*
- * Capstone kernel-mode memory allocator.
- * Provides malloc/calloc/realloc/free/vsnprintf for Capstone in kernel mode.
- *
- * From VmwareHardenedLoader (hzqst) — unchanged, hypervisor-independent.
+ * Capstone 5.x kernel-mode support.
+ * Provides memory allocators and printf stubs for kernel drivers.
  */
 
 #include <ntddk.h>
-#include <capstone/capstone.h>
 
 #define CS_POOL_TAG 'cshv'
 
-static void * __cdecl cs_km_malloc(size_t size)
+/* Capstone 5.x expects these specific function names for kernel mode */
+void *cs_winkernel_malloc(size_t size)
 {
     return ExAllocatePool2(POOL_FLAG_NON_PAGED, size, CS_POOL_TAG);
 }
 
-static void * __cdecl cs_km_calloc(size_t count, size_t size)
+void *cs_winkernel_calloc(size_t count, size_t size)
 {
     size_t total = count * size;
     void *p = ExAllocatePool2(POOL_FLAG_NON_PAGED, total, CS_POOL_TAG);
-    if (p) RtlZeroMemory(p, total);
+    /* ExAllocatePool2 already zeroes memory */
     return p;
 }
 
-static void * __cdecl cs_km_realloc(void *ptr, size_t size)
+void *cs_winkernel_realloc(void *ptr, size_t size)
 {
     void *newp = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, CS_POOL_TAG);
     if (newp && ptr) {
-        /* Can't know original size; copy up to new size (safe for grow) */
         RtlCopyMemory(newp, ptr, size);
         ExFreePoolWithTag(ptr, CS_POOL_TAG);
     }
     return newp;
 }
 
-static void __cdecl cs_km_free(void *ptr)
+void cs_winkernel_free(void *ptr)
 {
     if (ptr) ExFreePoolWithTag(ptr, CS_POOL_TAG);
 }
 
-static int __cdecl cs_km_vsnprintf(char *buffer, size_t count,
-                                    const char *format, va_list argptr)
+int cs_winkernel_vsnprintf(char *buffer, size_t count,
+                            const char *format, va_list argptr)
 {
+    /* Use ntoskrnl's _vsnprintf */
     return _vsnprintf(buffer, count, format, argptr);
 }
 
+/* Stub for __stdio_common_vsprintf (used by UCRT _vsnprintf) */
+int __cdecl __stdio_common_vsprintf(
+    unsigned __int64 options, char *buffer, size_t count,
+    const char *format, void *locale, va_list argptr)
+{
+    (void)options;
+    (void)locale;
+    return _vsnprintf(buffer, count, format, argptr);
+}
+
+/* Stubs for printf/fprintf (Capstone Mapping.c references these even in DIET mode) */
+void *__cdecl __acrt_iob_func(unsigned int index) { (void)index; return (void*)0; }
+int __cdecl __stdio_common_vfprintf(unsigned __int64 o, void *s, const char *f, void *l, va_list a)
+    { (void)o; (void)s; (void)f; (void)l; (void)a; return 0; }
+/* printf is defined in Capstone's Mapping.c — don't duplicate */
+
 void cs_driver_mm_init(void)
 {
-    cs_opt_mem mem = {
-        .malloc  = cs_km_malloc,
-        .calloc  = cs_km_calloc,
-        .realloc = cs_km_realloc,
-        .free    = cs_km_free,
-        .vsnprintf = cs_km_vsnprintf,
-    };
-    cs_option(0, CS_OPT_MEM, (size_t)&mem);
+    /* Capstone 5.x auto-detects kernel mode and uses cs_winkernel_* functions.
+     * No explicit cs_option(CS_OPT_MEM) call needed. */
 }

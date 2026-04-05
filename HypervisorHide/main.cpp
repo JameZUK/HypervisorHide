@@ -16,6 +16,7 @@
  */
 
 #include <fltkernel.h>
+#include <ntimage.h>
 #include "cs_driver_mm.h"
 
 extern "C"
@@ -367,7 +368,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
     if (!ntHeader) return STATUS_UNSUCCESSFUL;
 
     auto secHeader = (PIMAGE_SECTION_HEADER)(
-        (PUCHAR)ntHeader + FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader)
+        (PUCHAR)ntHeader + FIELD_OFFSET(IMAGE_NT_HEADERS64, OptionalHeader)
         + ntHeader->FileHeader.SizeOfOptionalHeader);
 
     PUCHAR PAGEBase = NULL;
