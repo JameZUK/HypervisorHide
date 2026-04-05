@@ -152,6 +152,231 @@ NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     OUT PULONG ReturnLength OPTIONAL);
 
 /* ------------------------------------------------------------------ */
+/*  Registry scrubbing                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Scrub VM indicator strings from registry values under a given key.
+ * Recursively walks subkeys. Replaces QEMU/BOCHS/Virtual/etc with spaces
+ * in REG_SZ and REG_MULTI_SZ values.
+ */
+static void ScrubRegistryKey(PUNICODE_STRING keyPath)
+{
+    OBJECT_ATTRIBUTES objAttr;
+    InitializeObjectAttributes(&objAttr, keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    HANDLE hKey;
+    NTSTATUS status = ZwOpenKey(&hKey, KEY_ALL_ACCESS, &objAttr);
+    if (!NT_SUCCESS(status)) return;
+
+    /* Enumerate values and scrub strings */
+    UCHAR valueBuf[512];
+    ULONG resultLen;
+    for (ULONG idx = 0; ; idx++) {
+        status = ZwEnumerateValueKey(hKey, idx, KeyValueFullInformation,
+                                     valueBuf, sizeof(valueBuf), &resultLen);
+        if (!NT_SUCCESS(status)) break;
+
+        auto *info = (PKEY_VALUE_FULL_INFORMATION)valueBuf;
+        if (info->Type != REG_SZ && info->Type != REG_MULTI_SZ) continue;
+        if (info->DataLength == 0 || info->DataLength > 400) continue;
+
+        PWCHAR data = (PWCHAR)((PUCHAR)info + info->DataOffset);
+        ULONG charCount = info->DataLength / sizeof(WCHAR);
+        BOOLEAN modified = FALSE;
+
+        /* Check each VM string (wide) */
+        static const WCHAR *vmStringsW[] = {
+            L"QEMU", L"qemu", L"BOCHS", L"bochs", L"Proxmox", L"proxmox",
+            L"VMware", L"VMWARE", L"VirtualBox", L"VBOX", L"Virtual",
+            L"Hyper-V", L"KVM", L"KVMKVMKVM", L"Red Hat", L"VirtIO",
+            L"EDK II", L"SeaBIOS", L"innotek", L"Parallels", L"Xen",
+            L"q35", L"pc-q35", NULL
+        };
+
+        for (int s = 0; vmStringsW[s]; s++) {
+            ULONG patLen = (ULONG)wcslen(vmStringsW[s]);
+            for (ULONG i = 0; i + patLen <= charCount; i++) {
+                BOOLEAN match = TRUE;
+                for (ULONG j = 0; j < patLen; j++) {
+                    if (data[i + j] != vmStringsW[s][j]) { match = FALSE; break; }
+                }
+                if (match) {
+                    for (ULONG j = 0; j < patLen; j++) data[i + j] = L' ';
+                    modified = TRUE;
+                }
+            }
+        }
+
+        if (modified) {
+            UNICODE_STRING valueName;
+            valueName.Buffer = info->Name;
+            valueName.Length = (USHORT)info->NameLength;
+            valueName.MaximumLength = (USHORT)info->NameLength;
+            ZwSetValueKey(hKey, &valueName, 0, info->Type,
+                          data, info->DataLength);
+        }
+    }
+
+    /* Recurse into subkeys */
+    UCHAR subkeyBuf[512];
+    for (ULONG idx = 0; ; idx++) {
+        status = ZwEnumerateKey(hKey, idx, KeyBasicInformation,
+                                subkeyBuf, sizeof(subkeyBuf), &resultLen);
+        if (!NT_SUCCESS(status)) break;
+
+        auto *subInfo = (PKEY_BASIC_INFORMATION)subkeyBuf;
+        /* Build full path: keyPath + \ + subkeyName */
+        WCHAR fullPath[512];
+        ULONG parentLen = keyPath->Length / sizeof(WCHAR);
+        if (parentLen + 1 + subInfo->NameLength / sizeof(WCHAR) >= 510) continue;
+
+        RtlCopyMemory(fullPath, keyPath->Buffer, keyPath->Length);
+        fullPath[parentLen] = L'\\';
+        RtlCopyMemory(&fullPath[parentLen + 1], subInfo->Name, subInfo->NameLength);
+        ULONG totalLen = keyPath->Length + sizeof(WCHAR) + subInfo->NameLength;
+        fullPath[totalLen / sizeof(WCHAR)] = 0;
+
+        UNICODE_STRING subPath;
+        subPath.Buffer = fullPath;
+        subPath.Length = (USHORT)totalLen;
+        subPath.MaximumLength = sizeof(fullPath);
+        ScrubRegistryKey(&subPath);
+    }
+
+    ZwClose(hKey);
+}
+
+/*
+ * Delete a registry key and all its subkeys (kernel-mode ZwDeleteKey).
+ * Must delete children first (bottom-up).
+ */
+static void DeleteKeyRecursive(PUNICODE_STRING keyPath)
+{
+    OBJECT_ATTRIBUTES objAttr;
+    InitializeObjectAttributes(&objAttr, keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    HANDLE hKey;
+    NTSTATUS status = ZwOpenKey(&hKey, KEY_ALL_ACCESS, &objAttr);
+    if (!NT_SUCCESS(status)) return;
+
+    /* Delete all subkeys first */
+    UCHAR buf[512];
+    ULONG resultLen;
+    /* Keep deleting index 0 until none left */
+    while (NT_SUCCESS(ZwEnumerateKey(hKey, 0, KeyBasicInformation, buf, sizeof(buf), &resultLen))) {
+        auto *info = (PKEY_BASIC_INFORMATION)buf;
+        WCHAR fullPath[512];
+        ULONG parentLen = keyPath->Length / sizeof(WCHAR);
+        if (parentLen + 1 + info->NameLength / sizeof(WCHAR) >= 510) break;
+        RtlCopyMemory(fullPath, keyPath->Buffer, keyPath->Length);
+        fullPath[parentLen] = L'\\';
+        RtlCopyMemory(&fullPath[parentLen + 1], info->Name, info->NameLength);
+        ULONG totalLen = keyPath->Length + sizeof(WCHAR) + info->NameLength;
+        fullPath[totalLen / sizeof(WCHAR)] = 0;
+        UNICODE_STRING subPath = { (USHORT)totalLen, sizeof(fullPath), fullPath };
+        DeleteKeyRecursive(&subPath);
+    }
+
+    ZwDeleteKey(hKey);
+    ZwClose(hKey);
+}
+
+/*
+ * Delete registry keys whose names contain VM indicators.
+ * Scans subkeys of parent paths and deletes any with QEMU/BOCHS/etc in name.
+ */
+static void DeleteVmRegistryKeys()
+{
+    static const WCHAR *parents[] = {
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\SCSI",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\ACPI",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\SWD\\COMPUTER",
+        NULL
+    };
+
+    static const WCHAR *vmPatterns[] = {
+        L"QEMU", L"qemu", L"BOCHS", L"VBOX", L"VMware", L"Proxmox",
+        L"Virtual", L"Hyper-V", L"Xen", L"Parallels", NULL
+    };
+
+    for (int p = 0; parents[p]; p++) {
+        UNICODE_STRING parentPath;
+        RtlInitUnicodeString(&parentPath, parents[p]);
+        OBJECT_ATTRIBUTES objAttr;
+        InitializeObjectAttributes(&objAttr, &parentPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        HANDLE hParent;
+        if (!NT_SUCCESS(ZwOpenKey(&hParent, KEY_ALL_ACCESS, &objAttr))) continue;
+
+        UCHAR buf[512];
+        ULONG resultLen;
+        /* Enumerate and collect keys to delete (can't delete while enumerating) */
+        WCHAR toDelete[8][256];
+        int deleteCount = 0;
+
+        for (ULONG idx = 0; deleteCount < 8; idx++) {
+            if (!NT_SUCCESS(ZwEnumerateKey(hParent, idx, KeyBasicInformation,
+                                           buf, sizeof(buf), &resultLen))) break;
+            auto *info = (PKEY_BASIC_INFORMATION)buf;
+            ULONG nameChars = info->NameLength / sizeof(WCHAR);
+
+            /* Check if subkey name contains any VM pattern */
+            for (int s = 0; vmPatterns[s]; s++) {
+                ULONG patLen = (ULONG)wcslen(vmPatterns[s]);
+                for (ULONG i = 0; i + patLen <= nameChars; i++) {
+                    BOOLEAN match = TRUE;
+                    for (ULONG j = 0; j < patLen; j++) {
+                        if (info->Name[i + j] != vmPatterns[s][j]) { match = FALSE; break; }
+                    }
+                    if (match && deleteCount < 8) {
+                        ULONG parentLen = parentPath.Length / sizeof(WCHAR);
+                        RtlCopyMemory(toDelete[deleteCount], parentPath.Buffer, parentPath.Length);
+                        toDelete[deleteCount][parentLen] = L'\\';
+                        RtlCopyMemory(&toDelete[deleteCount][parentLen + 1], info->Name, info->NameLength);
+                        toDelete[deleteCount][parentLen + 1 + nameChars] = 0;
+                        deleteCount++;
+                        goto next_key;
+                    }
+                }
+            }
+            next_key:;
+        }
+
+        ZwClose(hParent);
+
+        /* Now delete the collected keys */
+        for (int d = 0; d < deleteCount; d++) {
+            UNICODE_STRING delPath;
+            RtlInitUnicodeString(&delPath, toDelete[d]);
+            DeleteKeyRecursive(&delPath);
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                       "HypervisorHide: deleted key %wZ\n", &delPath);
+        }
+    }
+}
+
+static void ScrubAllRegistryVmStrings()
+{
+    static const WCHAR *paths[] = {
+        L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System",
+        L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\BIOS",
+        L"\\Registry\\Machine\\HARDWARE\\DEVICEMAP\\Scsi",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\SCSI",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\ACPI",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\SWD\\COMPUTER",
+        NULL
+    };
+
+    /* First scrub values */
+    for (int i = 0; paths[i]; i++) {
+        UNICODE_STRING path;
+        RtlInitUnicodeString(&path, paths[i]);
+        ScrubRegistryKey(&path);
+    }
+
+    /* Then delete keys with VM names */
+    DeleteVmRegistryKeys();
+}
+
+/* ------------------------------------------------------------------ */
 /*  Utility functions                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -613,8 +838,18 @@ do_hook:
         }
     }
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-               "HypervisorHide: loaded — ACPI=%p RSMB=%p FIRM=%p\n",
+    /* 5. Scrub VM strings from registry (device enum, BIOS info, etc.) */
+    __try {
+        ScrubAllRegistryVmStrings();
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: registry scrubbed\n");
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: registry scrub exception (non-fatal)\n");
+    }
+
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+               "HypervisorHide: loaded — ACPI=%p RSMB=%p FIRM=%p + registry\n",
                (PVOID)g_OriginalACPIHandler, (PVOID)g_OriginalRSMBHandler,
                (PVOID)g_OriginalFIRMHandler);
 
