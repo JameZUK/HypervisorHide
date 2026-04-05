@@ -523,46 +523,100 @@ do_hook:
     return STATUS_SUCCESS;
 
 #else
-    /* Production mode: hook the providers */
-    ExAcquireResourceExclusiveLite(
-        (PERESOURCE)g_ExpFirmwareTableResource, TRUE);
+    /* Production mode: hook the providers.
+     * NOTE: Do NOT acquire ExpFirmwareTableResource — it causes deadlocks.
+     * The list walk during DriverEntry is safe without the lock. */
 
-    PSYSTEM_FIRMWARE_TABLE_HANDLER_NODE node = NULL;
+    /* Walk the provider list with safety limits.
+     * The list head is at g_ExpFirmwareTableProviderListHead.
+     * Each node has FirmwareTableProviderList at offset 0x18 from the
+     * SYSTEM_FIRMWARE_TABLE_HANDLER_NODE start. */
+    __try {
+        PLIST_ENTRY listHead = (PLIST_ENTRY)g_ExpFirmwareTableProviderListHead;
+        PLIST_ENTRY entry = listHead->Flink;
+        int count = 0;
 
-    EX_FOR_EACH_IN_LIST(SYSTEM_FIRMWARE_TABLE_HANDLER_NODE,
-        FirmwareTableProviderList,
-        (PLIST_ENTRY)g_ExpFirmwareTableProviderListHead,
-        node) {
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: walking list at %p (Flink=%p)\n",
+                   listHead, entry);
 
-        if (!g_OriginalACPIHandler &&
-            node->SystemFWHandler.ProviderSignature == 'ACPI') {
-            g_OriginalACPIHandler = node->SystemFWHandler.FirmwareTableHandler;
-            node->SystemFWHandler.FirmwareTableHandler = MyACPIHandler;
-            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-                       "HypervisorHide: ACPI handler hooked\n");
+        while (entry != listHead && count < 20) {
+            count++;
+            PSYSTEM_FIRMWARE_TABLE_HANDLER_NODE node =
+                CONTAINING_RECORD(entry, SYSTEM_FIRMWARE_TABLE_HANDLER_NODE,
+                                  FirmwareTableProviderList);
+
+            ULONG sig = node->SystemFWHandler.ProviderSignature;
+            PFNFTH handler = node->SystemFWHandler.FirmwareTableHandler;
+            char sigStr[5] = {};
+            *(ULONG*)sigStr = sig;
+
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                       "HypervisorHide: [%d] sig='%s' (0x%08x) handler=%p\n",
+                       count, sigStr, sig, handler);
+
+            if (!g_OriginalACPIHandler && sig == 'ACPI' && handler) {
+                g_OriginalACPIHandler = handler;
+                node->SystemFWHandler.FirmwareTableHandler = MyACPIHandler;
+                DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                           "HypervisorHide: ACPI HOOKED\n");
+            }
+            if (!g_OriginalRSMBHandler && sig == 'RSMB' && handler) {
+                g_OriginalRSMBHandler = handler;
+                node->SystemFWHandler.FirmwareTableHandler = MyRSMBHandler;
+                DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                           "HypervisorHide: RSMB HOOKED\n");
+            }
+            if (!g_OriginalFIRMHandler && sig == 'FIRM' && handler) {
+                g_OriginalFIRMHandler = handler;
+                node->SystemFWHandler.FirmwareTableHandler = MyFIRMHandler;
+                DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                           "HypervisorHide: FIRM HOOKED\n");
+            }
+
+            entry = entry->Flink;
         }
-        if (!g_OriginalRSMBHandler &&
-            node->SystemFWHandler.ProviderSignature == 'RSMB') {
-            g_OriginalRSMBHandler = node->SystemFWHandler.FirmwareTableHandler;
-            node->SystemFWHandler.FirmwareTableHandler = MyRSMBHandler;
-            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-                       "HypervisorHide: RSMB handler hooked\n");
-        }
-        if (!g_OriginalFIRMHandler &&
-            node->SystemFWHandler.ProviderSignature == 'FIRM') {
-            g_OriginalFIRMHandler = node->SystemFWHandler.FirmwareTableHandler;
-            node->SystemFWHandler.FirmwareTableHandler = MyFIRMHandler;
-            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-                       "HypervisorHide: FIRM handler hooked\n");
-        }
+
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: walked %d providers\n", count);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: EXCEPTION during hook (bad pointer?)\n");
     }
-
-    ExReleaseResourceLite((PERESOURCE)g_ExpFirmwareTableResource);
 
     driverObject->DriverUnload = DriverUnload;
 
+    /* Write debug summary to a file readable from usermode */
+    {
+        UNICODE_STRING filePath;
+        RtlInitUnicodeString(&filePath, L"\\??\\C:\\Malware\\hvhide_log.txt");
+        OBJECT_ATTRIBUTES objAttr;
+        InitializeObjectAttributes(&objAttr, &filePath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        HANDLE hFile;
+        IO_STATUS_BLOCK ioStatus;
+        NTSTATUS fs = ZwCreateFile(&hFile, GENERIC_WRITE | SYNCHRONIZE, &objAttr, &ioStatus,
+                                    NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OVERWRITE_IF,
+                                    FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+        if (NT_SUCCESS(fs)) {
+            char buf[512];
+            /* Simple marker — if this file appears, driver reached this point */
+            const char *msg = "HypervisorHide loaded OK\r\n";
+            int len = 26;
+            /* Encode handler pointers as presence flags */
+            char flags[64] = "ACPI=0 RSMB=0 FIRM=0\r\n";
+            if (g_OriginalACPIHandler) flags[5] = '1';
+            if (g_OriginalRSMBHandler) flags[12] = '1';
+            if (g_OriginalFIRMHandler) flags[19] = '1';
+            ZwWriteFile(hFile, NULL, NULL, NULL, &ioStatus, (PVOID)msg, len, NULL, NULL);
+            ZwWriteFile(hFile, NULL, NULL, NULL, &ioStatus, flags, 22, NULL, NULL);
+            ZwClose(hFile);
+        }
+    }
+
     DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-               "HypervisorHide: loaded successfully — all firmware table providers hooked\n");
+               "HypervisorHide: loaded — ACPI=%p RSMB=%p FIRM=%p\n",
+               (PVOID)g_OriginalACPIHandler, (PVOID)g_OriginalRSMBHandler,
+               (PVOID)g_OriginalFIRMHandler);
 
     return STATUS_SUCCESS;
 #endif
