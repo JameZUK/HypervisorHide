@@ -161,10 +161,21 @@ static bool DisasmWalk(csh handle, PUCHAR code, SIZE_T codeLen,
 }
 
 /*
- * Fallback heuristic: scan for mov rax, [rip+disp] followed within
- * ~30 bytes by lea rcx, [rip+disp], both targeting the data section.
- * This catches the Win11 24H2 pattern where the structures are accessed
- * in a different order than older builds.
+ * Fallback heuristic for Win11 24H2+:
+ *
+ * Look for the firmware table REGISTRATION path (Match 3 pattern):
+ *   mov r8d, 'TFRA'        ; allocate pool with tag
+ *   call <ExAllocatePool>
+ *   ...
+ *   lea rdi, [rcx+0x18]    ; KEY ANCHOR: offset to LIST_ENTRY in node
+ *   ...
+ *   mov rax, [rip+disp]    ; ExpFirmwareTableProviderListHead
+ *   ...
+ *   lea rcx, [rip+disp]    ; ExpFirmwareTableResource
+ *
+ * The 'lea rdi, [rcx+0x18]' distinguishes the registration path from
+ * query paths. In the registration path, the structures are accessed
+ * in reverse order (ListHead before Resource).
  */
 static bool FallbackScan(csh handle, PUCHAR code, SIZE_T codeLen, uint64_t baseAddr)
 {
@@ -172,59 +183,69 @@ static bool FallbackScan(csh handle, PUCHAR code, SIZE_T codeLen, uint64_t baseA
     size_t count = cs_disasm(handle, code, codeLen, baseAddr, 0, &insn);
     if (count == 0) return false;
 
-    /* Collect all [rip+disp] targets pointing to kernel data section */
-    struct RipTarget { uint64_t addr; uint64_t target; int id; /* MOV or LEA */ };
-    RipTarget targets[64];
-    int numTargets = 0;
+    /* Look for 'lea rdi, [rcx+0x18]' — the registration path anchor */
+    bool foundAnchor = false;
+    PVOID listHead = NULL;
+    PVOID resource = NULL;
 
-    for (size_t i = 0; i < count && numTargets < 64; i++) {
+    for (size_t i = 0; i < count; i++) {
         cs_x86 *x86 = &insn[i].detail->x86;
-        if ((insn[i].id == X86_INS_MOV || insn[i].id == X86_INS_LEA) &&
+
+        /* Detect: lea rdi, [rcx+0x18] */
+        if (insn[i].id == X86_INS_LEA &&
             x86->op_count == 2 &&
             x86->operands[0].type == X86_OP_REG &&
+            x86->operands[0].reg == X86_REG_RDI &&
             x86->operands[1].type == X86_OP_MEM &&
-            x86->operands[1].mem.base == X86_REG_RIP) {
-
-            uint64_t target = insn[i].address + insn[i].size + x86->operands[1].mem.disp;
-            if (target >= (uint64_t)g_NtosBase && target < (uint64_t)g_NtosEnd) {
-                targets[numTargets].addr = insn[i].address;
-                targets[numTargets].target = target;
-                targets[numTargets].id = insn[i].id;
-                numTargets++;
-            }
+            x86->operands[1].mem.base == X86_REG_RCX &&
+            x86->operands[1].mem.disp == 0x18) {
+            foundAnchor = true;
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
+                       "HypervisorHide: found 'lea rdi,[rcx+18h]' anchor at %p\n",
+                       (PVOID)insn[i].address);
         }
-    }
 
-    /* Look for a pair: one MOV and one LEA targeting different addresses
-     * in the data section, within 30 instructions of each other */
-    for (int i = 0; i < numTargets; i++) {
-        for (int j = i + 1; j < numTargets && j < i + 8; j++) {
-            if (targets[i].target == targets[j].target) continue;
+        /* After the anchor, collect rip-relative data targets */
+        if (foundAnchor) {
+            if ((insn[i].id == X86_INS_MOV || insn[i].id == X86_INS_LEA) &&
+                x86->op_count == 2 &&
+                x86->operands[0].type == X86_OP_REG &&
+                x86->operands[1].type == X86_OP_MEM &&
+                x86->operands[1].mem.base == X86_REG_RIP) {
 
-            /* One should be LEA (Resource), one should be MOV (ListHead) */
-            PVOID resource = NULL;
-            PVOID listHead = NULL;
+                uint64_t target = insn[i].address + insn[i].size +
+                                  x86->operands[1].mem.disp;
 
-            if (targets[i].id == X86_INS_LEA)
-                resource = (PVOID)targets[i].target;
-            else if (targets[i].id == X86_INS_MOV)
-                listHead = (PVOID)targets[i].target;
+                if (target >= (uint64_t)g_NtosBase &&
+                    target < (uint64_t)g_NtosEnd) {
 
-            if (targets[j].id == X86_INS_LEA && !resource)
-                resource = (PVOID)targets[j].target;
-            else if (targets[j].id == X86_INS_MOV && !listHead)
-                listHead = (PVOID)targets[j].target;
+                    if (insn[i].id == X86_INS_MOV && !listHead) {
+                        listHead = (PVOID)target;
+                        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
+                                   "HypervisorHide: ListHead candidate: %p\n",
+                                   listHead);
+                    }
+                    if (insn[i].id == X86_INS_LEA && !resource) {
+                        resource = (PVOID)target;
+                        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
+                                   "HypervisorHide: Resource candidate: %p\n",
+                                   resource);
+                    }
 
-            if (resource && listHead) {
-                g_ExpFirmwareTableResource = resource;
-                g_ExpFirmwareTableProviderListHead = listHead;
-
-                DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-                           "HypervisorHide: FALLBACK Resource=%p ListHead=%p\n",
-                           resource, listHead);
-                cs_free(insn, count);
-                return true;
+                    if (listHead && resource) {
+                        g_ExpFirmwareTableProviderListHead = listHead;
+                        g_ExpFirmwareTableResource = resource;
+                        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
+                                   "HypervisorHide: FOUND Resource=%p ListHead=%p\n",
+                                   resource, listHead);
+                        cs_free(insn, count);
+                        return true;
+                    }
+                }
             }
+
+            /* Stop at ret */
+            if (insn[i].id == X86_INS_RET) break;
         }
     }
 

@@ -19,9 +19,11 @@
 #include <ntimage.h>
 #include "cs_driver_mm.h"
 
-/* Set to 1 to only log what would be hooked, without actually hooking.
- * This prevents BSODs while debugging the pattern matcher. */
+/* Set to 1 to only log what would be hooked, without actually hooking. */
 #define HYPERVISORHIDE_DEBUG_ONLY 1
+
+/* Set to 1 to skip ALL driver logic and just return SUCCESS (bare minimum test) */
+#define HYPERVISORHIDE_STUB_ONLY 1
 
 extern "C"
 {
@@ -356,6 +358,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
     UNREFERENCED_PARAMETER(registryPath);
     PAGED_CODE();
 
+#if HYPERVISORHIDE_STUB_ONLY
+    driverObject->DriverUnload = DriverUnload;
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+               "HypervisorHide: STUB MODE — driver loaded, doing nothing\n");
+    return STATUS_SUCCESS;
+#endif
+
     DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
                "HypervisorHide: loading (universal hypervisor firmware scrubber)\n");
 
@@ -433,7 +442,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
         DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
                    "HypervisorHide: firmware table structures not found "
                    "(%d pattern matches tried)\n", matchCount);
+#if HYPERVISORHIDE_DEBUG_ONLY
+        /* In debug mode, succeed anyway so we stay loaded for diagnostics */
+        driverObject->DriverUnload = DriverUnload;
+        return STATUS_SUCCESS;
+#else
         return STATUS_UNSUCCESSFUL;
+#endif
     }
 
     /* 4. Validate the pointers before using them */
