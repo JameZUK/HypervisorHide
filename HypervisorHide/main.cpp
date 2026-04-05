@@ -92,6 +92,11 @@ static const char *g_ScrubStrings[] = {
     "VirtIO",
     "virtio",
     "EDK II",
+    "EDK2",
+    "WAET",
+    "pc-q35",
+    "pc-i440fx",
+    "q35",
 
     NULL  /* sentinel */
 };
@@ -370,7 +375,7 @@ static void ScrubRegistryKey(PUNICODE_STRING keyPath)
             L"QEMU", L"qemu", L"BOCHS", L"bochs", L"Proxmox", L"proxmox",
             L"VMware", L"VMWARE", L"VirtualBox", L"VBOX", L"Virtual",
             L"Hyper-V", L"KVM", L"KVMKVMKVM", L"Red Hat", L"VirtIO",
-            L"EDK II", L"SeaBIOS", L"innotek", L"Parallels", L"Xen",
+            L"EDK II", L"EDK2", L"SeaBIOS", L"innotek", L"Parallels", L"Xen",
             L"q35", L"pc-q35", NULL
         };
 
