@@ -19,6 +19,10 @@
 #include <ntimage.h>
 #include "cs_driver_mm.h"
 
+/* Set to 1 to only log what would be hooked, without actually hooking.
+ * This prevents BSODs while debugging the pattern matcher. */
+#define HYPERVISORHIDE_DEBUG_ONLY 1
+
 extern "C"
 {
 
@@ -389,26 +393,107 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
         return STATUS_UNSUCCESSFUL;
     }
 
-    /* 3. Locate ExpFirmwareTable* via pattern + disassembly */
-    /*    Pattern: mov r8d, 'TFRA' = 41 B8 41 52 46 54     */
-    auto findMovTag = UtilMemMem(PAGEBase, PAGESize,
-                                  "\x41\xB8\x41\x52\x46\x54", 6);
-    if (!findMovTag) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-                   "HypervisorHide: mov r8d,'TFRA' pattern not found\n");
-        return STATUS_UNSUCCESSFUL;
-    }
-
+    /* 3. Locate ExpFirmwareTable* via pattern + disassembly        */
+    /*    Pattern: mov r8d, 'TFRA' = 41 B8 41 52 46 54            */
+    /*    Multiple matches exist — iterate all until one succeeds. */
     cs_driver_mm_init();
 
-    if (!LocateExpFirmwareTablePointers(
-            (PUCHAR)findMovTag + 6, 0x300)) {
+    PUCHAR searchBase = PAGEBase;
+    SIZE_T searchLen = PAGESize;
+    bool found = false;
+    int matchCount = 0;
+
+    while (searchLen > 6) {
+        auto findMovTag = UtilMemMem(searchBase, searchLen,
+                                      "\x41\xB8\x41\x52\x46\x54", 6);
+        if (!findMovTag) break;
+
+        matchCount++;
+        PUCHAR matchAddr = (PUCHAR)findMovTag;
+
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
+                   "HypervisorHide: trying pattern match %d at %p\n",
+                   matchCount, matchAddr);
+
+        if (LocateExpFirmwareTablePointers(matchAddr + 6, 0x400)) {
+            found = true;
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
+                       "HypervisorHide: found structures at match %d\n",
+                       matchCount);
+            break;
+        }
+
+        /* Advance past this match */
+        SIZE_T consumed = (SIZE_T)(matchAddr + 6 - searchBase);
+        searchBase = matchAddr + 6;
+        searchLen -= consumed;
+    }
+
+    if (!found) {
         DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-                   "HypervisorHide: firmware table structures not found\n");
+                   "HypervisorHide: firmware table structures not found "
+                   "(%d pattern matches tried)\n", matchCount);
         return STATUS_UNSUCCESSFUL;
     }
 
-    /* 4. Hook firmware table providers */
+    /* 4. Validate the pointers before using them */
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
+               "HypervisorHide: Resource=%p ListHead=%p\n",
+               g_ExpFirmwareTableResource, g_ExpFirmwareTableProviderListHead);
+
+    /* Sanity check: both must be in kernel data section */
+    if (g_ExpFirmwareTableResource < g_NtosBase ||
+        g_ExpFirmwareTableResource >= g_NtosEnd ||
+        g_ExpFirmwareTableProviderListHead < g_NtosBase ||
+        g_ExpFirmwareTableProviderListHead >= g_NtosEnd) {
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: pointers outside ntoskrnl range — aborting\n");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+#if HYPERVISORHIDE_DEBUG_ONLY
+    /* Debug mode: log what we found but don't touch anything.
+     * Check DebugView or WinDbg for output. */
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+               "HypervisorHide: DEBUG MODE — not hooking. "
+               "Resource=%p ListHead=%p. "
+               "Set HYPERVISORHIDE_DEBUG_ONLY=0 and rebuild to enable hooking.\n",
+               g_ExpFirmwareTableResource, g_ExpFirmwareTableProviderListHead);
+
+    /* Try to read the list head to verify it's a valid LIST_ENTRY */
+    __try {
+        PLIST_ENTRY listHead = (PLIST_ENTRY)g_ExpFirmwareTableProviderListHead;
+        PLIST_ENTRY flink = listHead->Flink;
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: ListHead->Flink=%p (valid read)\n", flink);
+
+        /* Walk the list and log provider signatures */
+        PLIST_ENTRY current = flink;
+        int count = 0;
+        while (current != listHead && count < 20) {
+            PSYSTEM_FIRMWARE_TABLE_HANDLER_NODE node =
+                CONTAINING_RECORD(current, SYSTEM_FIRMWARE_TABLE_HANDLER_NODE,
+                                  FirmwareTableProviderList);
+            char sig[5] = {};
+            *(ULONG*)sig = node->SystemFWHandler.ProviderSignature;
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                       "HypervisorHide: Provider '%s' handler=%p\n",
+                       sig, node->SystemFWHandler.FirmwareTableHandler);
+            current = current->Flink;
+            count++;
+        }
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: %d providers found\n", count);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
+                   "HypervisorHide: EXCEPTION reading list — pointers are WRONG\n");
+    }
+
+    driverObject->DriverUnload = DriverUnload;
+    return STATUS_SUCCESS;
+
+#else
+    /* Production mode: hook the providers */
     ExAcquireResourceExclusiveLite(
         (PERESOURCE)g_ExpFirmwareTableResource, TRUE);
 
@@ -450,6 +535,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
                "HypervisorHide: loaded successfully — all firmware table providers hooked\n");
 
     return STATUS_SUCCESS;
+#endif
 }
 
 } /* extern "C" */
